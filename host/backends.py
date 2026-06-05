@@ -21,11 +21,6 @@ BACKENDS = {
         "description": "Runs commands on the host with best-effort /work and /context path rewriting.",
         "requires": ["bash"],
     },
-    "e2b": {
-        "status": "declared-stub",
-        "description": "Reserved for an E2B adapter; start currently fails until configured.",
-        "requires": [],
-    },
     "docker-sandboxes": {
         "status": "implemented",
         "description": "Docker Sandboxes backend via sbx create/exec/rm with /work and /context aliases.",

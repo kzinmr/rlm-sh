@@ -125,6 +125,12 @@ python3 host/sandbox.py build --backend docker --image rlm-sh-sandbox:dev
 
 # Docker Sandboxes backend: Docker image を sbx template store に load する
 python3 host/sandbox.py build --backend docker-sandboxes --image rlm-sh-sandbox:dev
+
+# Docker Hub timeout 時に同名の local image が既にあるなら再ビルドせず load する
+python3 host/sandbox.py build \
+  --backend docker-sandboxes \
+  --image rlm-sh-sandbox:dev \
+  --load-existing
 ```
 
 ### 4. M0 smoke: sandbox wiring
@@ -133,7 +139,7 @@ export RLMSH_KEY=fake-key
 
 python3 host/sandbox.py m0-check \
   --backend docker \
-  --run-dir .runs/verify-m0-docker \
+  --run-dir /path/to/docker-writable-run-dir \
   --run-id verify-m0-docker \
   --api-key-env RLMSH_KEY
 
@@ -148,8 +154,45 @@ python3 host/sandbox.py m0-check \
 
 ```bash
 export RLMSH_KEY="sk-..."
-python3 host/sandbox.py m0-check --backend docker --live-llm --api-key-env RLMSH_KEY
+python3 host/sandbox.py m0-check --backend docker-sandboxes --live-llm --api-key-env RLMSH_KEY
 ```
+
+#### Docker backend で `/work` が read-only になる場合
+
+`m0-check --backend docker` で `/work/...: Read-only file system` が出る場合、Docker inspect 上は mount が `RW=true` でも、Docker VM 側には workspace が read-only として渡っていることがあります。`--skip-preflight` は根本的な回避策ではなく、後続の `/work` 書き込みで同じ失敗になります。
+
+この環境では Docker Sandboxes backend を使うのが最短です。
+
+```bash
+export RLMSH_KEY=fake-key
+python3 host/backends.py check --backend docker-sandboxes
+python3 host/sandbox.py build --backend docker-sandboxes --image rlm-sh-sandbox:dev
+python3 host/sandbox.py m0-check --backend docker-sandboxes --api-key-env RLMSH_KEY
+```
+
+Docker backend のまま検証する場合は、Docker Desktop / Lima から container writable として共有され、かつ host から同じファイルが見えるパスを用意し、その場所を `--run-dir` または `--work-dir` に指定してください。この rootless Lima Docker 環境では repo 配下は read-only、`/private/tmp` と `$TMPDIR` は mount source 作成不可、literal の `/tmp/...` は Docker VM 内には書けるものの host から見えないため rlm-sh の workdir には使えません。
+
+```bash
+export RLMSH_KEY=fake-key
+python3 host/sandbox.py m0-check \
+  --backend docker \
+  --run-dir /path/to/docker-writable-run-dir \
+  --run-id verify-m0-docker \
+  --api-key-env RLMSH_KEY
+```
+
+#### Docker Hub の metadata 解決が timeout する場合
+
+`debian:bookworm-slim` の `load metadata` で `TLS handshake timeout` が出る場合は、Docker Hub への一時的な接続失敗です。同名の local image が既にある場合は、再ビルドせず Docker Sandboxes template store へ load できます。
+
+```bash
+python3 host/sandbox.py build \
+  --backend docker-sandboxes \
+  --image rlm-sh-sandbox:dev \
+  --load-existing
+```
+
+local image がない場合は、ネットワークが復旧してから `docker pull debian:bookworm-slim` または通常の `sandbox.py build` を再実行してください。
 
 ### 5. Backend exec smoke
 ```bash
@@ -203,7 +246,7 @@ Docker Sandboxes で同じ確認をする場合は `--backend docker-sandboxes` 
 python3 tasks/mapreduce.py generate --out .runs/mr-context --docs 48
 
 host/loop_shell.sh \
-  --backend docker \
+  --backend docker-sandboxes \
   --query "$(cat .runs/mr-context/query.txt)" \
   --context-dir .runs/mr-context
 

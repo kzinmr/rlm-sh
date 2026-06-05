@@ -55,6 +55,11 @@ def require_key(env_name: str, *, allow_openai_fallback: bool = False) -> str:
     )
 
 
+def lexical_abs_path(value: str | os.PathLike[str]) -> Path:
+    """Return an absolute host path without resolving symlinks such as /tmp."""
+    return Path(os.path.abspath(os.path.expanduser(os.fspath(value))))
+
+
 def run_checked(cmd: list[str], *, capture: bool = False, timeout: float | None = None):
     try:
         return subprocess.run(
@@ -82,8 +87,8 @@ def run_checked(cmd: list[str], *, capture: bool = False, timeout: float | None 
 
 
 def docker_run_args(args: argparse.Namespace, key: str) -> list[str]:
-    work_dir = Path(args.work_dir).resolve()
-    context_dir = Path(args.context_dir).resolve()
+    work_dir = lexical_abs_path(args.work_dir)
+    context_dir = lexical_abs_path(args.context_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
     if not context_dir.is_dir():
         raise SystemExit(f"sandbox.py: context dir not found: {context_dir}")
@@ -141,6 +146,21 @@ def docker_run_args(args: argparse.Namespace, key: str) -> list[str]:
         )
     cmd.extend([args.image, "tail", "-f", "/dev/null"])
     return cmd
+
+
+def ensure_docker_image_exists(image: str) -> None:
+    probe = subprocess.run(
+        ["docker", "image", "inspect", image],
+        text=True,
+        capture_output=True,
+    )
+    if probe.returncode != 0:
+        if probe.stderr:
+            print(probe.stderr, end="", file=sys.stderr)
+        raise SystemExit(
+            f"sandbox.py: docker image not found: {image}. "
+            "Run build without --load-existing after Docker Hub is reachable."
+        )
 
 
 def local_state_path(work_dir: Path) -> Path:
@@ -345,7 +365,7 @@ def cmd_start_sbx(args: argparse.Namespace) -> int:
     ]
     created = False
     try:
-        run_checked(create_cmd, capture=True, timeout=120)
+        run_checked(create_cmd, capture=True, timeout=180)
         created = True
         sbx_setup_mount_aliases(name, work_dir, context_dir)
         if not args.skip_preflight:
@@ -567,10 +587,12 @@ def preflight_mounts(container_name: str, work_dir: Path) -> None:
             print(exc.stdout, end="", file=sys.stdout)
         if exc.stderr:
             print(exc.stderr, end="", file=sys.stderr)
+        docker_mount_hint(container_name, work_dir, symptom="read-only")
         raise SystemExit(
             "sandbox.py: mount preflight failed. /work must be writable and "
             "/context must be readable read-only. Choose a Docker-shared writable "
-            "run directory with --run-dir/--work-dir."
+            "run directory with --run-dir/--work-dir, or use "
+            "--backend docker-sandboxes when Docker bind mounts are read-only."
         ) from exc
     except subprocess.TimeoutExpired as exc:
         if exc.stdout:
@@ -582,6 +604,7 @@ def preflight_mounts(container_name: str, work_dir: Path) -> None:
         raise SystemExit("sandbox.py: mount preflight timed out") from exc
 
     if not probe_path.is_file():
+        docker_mount_hint(container_name, work_dir, symptom="not-visible")
         raise SystemExit(
             "sandbox.py: mount preflight failed. Container wrote to /work, but "
             "the probe was not visible on the host bind mount."
@@ -592,21 +615,68 @@ def preflight_mounts(container_name: str, work_dir: Path) -> None:
         raise SystemExit("sandbox.py: mount preflight failed. Probe content mismatch.")
 
 
+def docker_mount_hint(container_name: str, work_dir: Path, *, symptom: str) -> None:
+    try:
+        inspect = subprocess.run(
+            ["docker", "inspect", container_name, "--format", "{{json .Mounts}}"],
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        return
+    if inspect.returncode == 0 and inspect.stdout.strip():
+        print(
+            f"sandbox.py: docker mounts for {container_name}: {inspect.stdout.strip()}",
+            file=sys.stderr,
+        )
+    try:
+        probe = work_dir / ".rlmsh_docker_host_write_probe"
+        probe.write_text("ok\n", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+    except OSError as exc:
+        print(
+            f"sandbox.py: host cannot write to work dir {work_dir}: {exc}",
+            file=sys.stderr,
+        )
+        return
+    if symptom == "not-visible":
+        print(
+            "sandbox.py: host work dir is writable, but /work writes were not "
+            "reflected back to the host. The Docker daemon may be using a "
+            "VM-local path rather than a host-shared bind mount. Move --run-dir "
+            "to a host-visible writable Docker/Lima shared path.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "sandbox.py: host work dir is writable, but the Docker VM exposed /work "
+            "as read-only. This usually means the current workspace is shared into "
+            "Docker Desktop as read-only by the outer environment. Prefer "
+            "'--backend docker-sandboxes' in this environment, or move --run-dir to "
+            "a Docker Desktop shared path that is writable from containers.",
+            file=sys.stderr,
+        )
+
+
 def cmd_build(args: argparse.Namespace) -> int:
     backend = getattr(args, "backend", "docker")
     if backend == "local-unsafe":
         print("sandbox.py: local-unsafe backend does not require an image build")
         return 0
-    cmd = [
-        "docker",
-        "build",
-        "-f",
-        str(PROJECT_ROOT / "Dockerfile.sandbox"),
-        "-t",
-        args.image,
-        str(PROJECT_ROOT),
-    ]
-    run_checked(cmd)
+    if getattr(args, "load_existing", False):
+        ensure_docker_image_exists(args.image)
+    else:
+        cmd = [
+            "docker",
+            "build",
+            "-f",
+            str(PROJECT_ROOT / "Dockerfile.sandbox"),
+            "-t",
+            args.image,
+            str(PROJECT_ROOT),
+        ]
+        run_checked(cmd)
     if backend == "docker-sandboxes":
         with tempfile.TemporaryDirectory(prefix="rlm-sh-sbx-template-") as tmp:
             tar_path = Path(tmp) / "rlm-sh-sandbox.tar"
@@ -632,7 +702,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         run_checked(cmd, capture=True)
         started = True
         if not args.skip_preflight:
-            preflight_mounts(name, Path(args.work_dir).resolve())
+            preflight_mounts(name, lexical_abs_path(args.work_dir))
     except (Exception, SystemExit):
         if started:
             subprocess.run(["docker", "rm", "-f", name], capture_output=True)
@@ -724,12 +794,14 @@ def cmd_m0_check(args: argparse.Namespace) -> int:
         )
     run_id = args.run_id or f"m0-{uuid4().hex[:12]}"
     temp_root = (
-        Path(args.run_dir).resolve()
+        lexical_abs_path(args.run_dir)
         if args.run_dir
         else PROJECT_ROOT / ".runs" / run_id
     )
     context_dir = (
-        Path(args.context_dir).resolve() if args.context_dir else temp_root / "context"
+        lexical_abs_path(args.context_dir)
+        if args.context_dir
+        else temp_root / "context"
     )
     work_dir = temp_root / "work"
     context_dir.mkdir(parents=True, exist_ok=True)
@@ -842,6 +914,11 @@ def parse_args() -> argparse.Namespace:
         default="docker",
     )
     build.add_argument("--image", default=DEFAULT_IMAGE)
+    build.add_argument(
+        "--load-existing",
+        action="store_true",
+        help="skip docker build and load an existing local image into the backend",
+    )
     build.set_defaults(func=cmd_build)
 
     start = subparsers.add_parser("start")
@@ -908,7 +985,7 @@ def parse_args() -> argparse.Namespace:
     m0.add_argument("--cpus", type=float, default=1.0)
     m0.add_argument("--pids-limit", type=int, default=256)
     m0.add_argument("--model", default="gpt-5-mini")
-    m0.add_argument("--timeout", type=float, default=60.0)
+    m0.add_argument("--timeout", type=float, default=180.0)
     m0.add_argument("--run-id", default=None)
     m0.add_argument("--build", action="store_true")
     m0.add_argument("--live-llm", action="store_true")

@@ -18,6 +18,7 @@ TRUNCATE_CHARS=12000
 API_KEY_ENV="RLMSH_KEY"
 SYSTEM_PROMPT=""
 BUILD_IMAGE=0
+LOAD_EXISTING=0
 KEEP_CONTAINER=0
 READ_ONLY_ROOT=0
 ALLOW_OPENAI_KEY_FALLBACK=0
@@ -38,8 +39,9 @@ usage:
 
 options:
   --build                    Build Dockerfile.sandbox before starting.
-  --backend NAME             Sandbox backend: docker, local-unsafe, e2b, docker-sandboxes
-                             (default: docker; e2b is a declared stub).
+  --load-existing            With --build, skip docker build and load existing image.
+  --backend NAME             Sandbox backend: docker, local-unsafe, docker-sandboxes
+                             (default: docker).
   --image NAME               Docker image name (default: rlm-sh-sandbox:dev).
   --root-model MODEL         Root controller model (default: gpt-5).
   --max-iters N              Maximum bash execution turns (default: 12).
@@ -148,6 +150,10 @@ while [[ $# -gt 0 ]]; do
       BUILD_IMAGE=1
       shift
       ;;
+    --load-existing)
+      LOAD_EXISTING=1
+      shift
+      ;;
     --keep-container)
       KEEP_CONTAINER=1
       shift
@@ -202,7 +208,7 @@ if [[ ! -f "$SYSTEM_PROMPT" ]]; then
 fi
 
 if [[ -z "$RUN_ID" ]]; then
-  RUN_ID="run_$(date -u +%Y%m%dT%H%M%SZ)_$$"
+  RUN_ID="run-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 fi
 if [[ -z "$RUN_DIR" ]]; then
   RUN_DIR="$PROJECT_DIR/.runs/$RUN_ID"
@@ -225,8 +231,15 @@ validate_context_hash() {
     --out "$CONTEXT_HASH_END"
 }
 
+build_args=()
+if [[ "$LOAD_EXISTING" -eq 1 ]]; then
+  build_args=(--load-existing)
+fi
 if [[ "$BUILD_IMAGE" -eq 1 ]]; then
-  python3 "$SCRIPT_DIR/sandbox.py" build --backend "$BACKEND" --image "$IMAGE"
+  python3 "$SCRIPT_DIR/sandbox.py" build \
+    --backend "$BACKEND" \
+    --image "$IMAGE" \
+    "${build_args[@]+"${build_args[@]}"}"
 fi
 
 read_only_args=()
@@ -343,14 +356,14 @@ echo "rlm-sh: root_cid=$ROOT_CID" >&2
 
 {
   printf '# rlm-sh transcript\n\n'
-  printf '- run_id: `%s`\n' "$RUN_ID"
-  printf '- root_model: `%s`\n' "$ROOT_MODEL"
-  printf '- root_db: `%s`\n' "$ROOT_DB"
-  printf '- context_dir: `%s`\n\n' "$CONTEXT_DIR"
-  printf '- context_hash: `%s`\n' "$CONTEXT_HASH_START"
-  printf '- backend: `%s`\n' "$BACKEND"
-  printf '- depth: `%s`\n' "$DEPTH"
-  printf '- sandbox_id: `%s`\n\n' "$CONTAINER"
+  printf -- '- run_id: `%s`\n' "$RUN_ID"
+  printf -- '- root_model: `%s`\n' "$ROOT_MODEL"
+  printf -- '- root_db: `%s`\n' "$ROOT_DB"
+  printf -- '- context_dir: `%s`\n\n' "$CONTEXT_DIR"
+  printf -- '- context_hash: `%s`\n' "$CONTEXT_HASH_START"
+  printf -- '- backend: `%s`\n' "$BACKEND"
+  printf -- '- depth: `%s`\n' "$DEPTH"
+  printf -- '- sandbox_id: `%s`\n\n' "$CONTAINER"
 } > "$TRANSCRIPT"
 
 for iter in $(seq 1 "$MAX_ITERS"); do
