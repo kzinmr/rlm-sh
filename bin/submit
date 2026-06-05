@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+answer_path="${RLM_SH_ANSWER_PATH:-/work/answer.txt}"
+source_file=""
+
+usage() {
+  cat <<'USAGE'
+usage:
+  submit < answer.txt
+  submit "final answer"
+  submit -f buffers/final.txt
+
+Writes the final answer to /work/answer.txt, or to RLM_SH_ANSWER_PATH if set.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -f|--file)
+      if [[ $# -lt 2 ]]; then
+        echo "submit: missing file after $1" >&2
+        exit 2
+      fi
+      source_file="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "submit: unknown option $1" >&2
+      usage >&2
+      exit 2
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+mkdir -p "$(dirname "$answer_path")"
+tmp_path="${answer_path}.tmp.$$"
+trap 'rm -f "$tmp_path"' EXIT
+
+if [[ -n "$source_file" ]]; then
+  if [[ $# -gt 0 ]]; then
+    echo "submit: pass either -f/--file or literal answer text, not both" >&2
+    exit 2
+  fi
+  if [[ ! -f "$source_file" ]]; then
+    echo "submit: file not found: $source_file" >&2
+    exit 1
+  fi
+  cp "$source_file" "$tmp_path"
+elif [[ $# -gt 0 ]]; then
+  printf '%s\n' "$*" > "$tmp_path"
+else
+  cat > "$tmp_path"
+fi
+
+mv "$tmp_path" "$answer_path"
+trap - EXIT
+bytes="$(wc -c < "$answer_path" | tr -d '[:space:]')"
+echo "submit: wrote $answer_path ($bytes bytes)" >&2

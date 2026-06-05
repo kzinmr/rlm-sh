@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""Sandbox-side thin client for recursive rlm-sh spawn requests."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path, PurePosixPath
+import sys
+import time
+from datetime import datetime, timezone
+from uuid import uuid4
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Queue a recursive rlm-sh request for the host orchestrator."
+    )
+    parser.add_argument("query", nargs="+", help="subquery for the child rlm-sh run")
+    parser.add_argument(
+        "-c",
+        "--context",
+        default="context",
+        help="relative path under /work to snapshot for the child context",
+    )
+    parser.add_argument("-m", "--model", default=None, help="optional root model hint")
+    parser.add_argument(
+        "--spawn-dir",
+        default=os.environ.get("RLM_SH_SPAWN_DIR", "/work/.spawn"),
+        help="shared spawn directory, normally /work/.spawn",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=float(os.environ.get("RLM_SH_SPAWN_TIMEOUT", "300")),
+        help="seconds to wait for <request>.out when --detach is not used",
+    )
+    parser.add_argument(
+        "--detach",
+        action="store_true",
+        help="only write the spawn request and print its id",
+    )
+    return parser.parse_args()
+
+
+def validate_relative_context(value: str) -> str:
+    path = PurePosixPath(value)
+    if path.is_absolute() or any(part == ".." for part in path.parts):
+        raise ValueError(
+            "context must be a relative /work path without '..' components"
+        )
+    normalized = str(path)
+    if normalized in ("", "."):
+        raise ValueError("context path must not be empty")
+    return normalized
+
+
+def atomic_write_json(path: Path, payload: dict[str, object]) -> None:
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write("\n")
+    tmp.replace(path)
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        rel_context_path = validate_relative_context(args.context)
+    except ValueError as exc:
+        print(f"rlm-sh: {exc}", file=sys.stderr)
+        return 2
+
+    request_id = f"spawn_{uuid4().hex}"
+    spawn_dir = Path(args.spawn_dir)
+    spawn_dir.mkdir(parents=True, exist_ok=True)
+
+    depth_raw = os.environ.get("RLM_SH_DEPTH", "0")
+    try:
+        depth = int(depth_raw)
+    except ValueError:
+        print(f"rlm-sh: invalid RLM_SH_DEPTH={depth_raw!r}", file=sys.stderr)
+        return 2
+
+    payload: dict[str, object] = {
+        "protocol_version": 1,
+        "id": request_id,
+        "run_id": os.environ.get("RLM_SH_RUN_ID", ""),
+        "parent_sandbox_id": os.environ.get("RLM_SH_SANDBOX_ID", ""),
+        "parent_call_id": os.environ.get("RLM_SH_PARENT_CALL_ID", ""),
+        "depth": depth,
+        "requested_depth": depth + 1,
+        "rel_context_path": rel_context_path,
+        "query": " ".join(args.query),
+        "model": args.model,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "cwd": os.getcwd(),
+    }
+
+    request_path = spawn_dir / f"{request_id}.json"
+    out_path = spawn_dir / f"{request_id}.out"
+    err_path = spawn_dir / f"{request_id}.err"
+    atomic_write_json(request_path, payload)
+    print(f"rlm-sh: queued {request_id}", file=sys.stderr)
+
+    if args.detach:
+        print(request_id)
+        return 0
+
+    deadline = time.monotonic() + args.timeout
+    while time.monotonic() < deadline:
+        if out_path.exists():
+            sys.stdout.write(out_path.read_text(encoding="utf-8"))
+            return 0
+        if err_path.exists():
+            sys.stderr.write(err_path.read_text(encoding="utf-8"))
+            return 1
+        time.sleep(0.25)
+
+    print(
+        f"rlm-sh: timed out waiting for host orchestrator result: {request_id}",
+        file=sys.stderr,
+    )
+    print(f"rlm-sh: request file is {request_path}", file=sys.stderr)
+    return 124
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
