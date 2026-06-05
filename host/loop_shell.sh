@@ -9,6 +9,7 @@ CONTEXT_DIR=""
 RUN_DIR=""
 RUN_ID=""
 IMAGE="rlm-sh-sandbox:dev"
+BACKEND="docker"
 ROOT_MODEL="gpt-5"
 MAX_ITERS=12
 MAX_ROOT_CALLS=16
@@ -21,6 +22,14 @@ KEEP_CONTAINER=0
 READ_ONLY_ROOT=0
 ALLOW_OPENAI_KEY_FALLBACK=0
 SKIP_PREFLIGHT=0
+DEPTH=0
+PARENT_SANDBOX_ID=""
+MAX_DEPTH=2
+MAX_SPAWNS=32
+MAX_PARALLEL_CHILDREN=2
+CHILD_TIMEOUT=900
+ORCHESTRATOR_ENABLED=1
+SPAWN_POLL_INTERVAL=0.25
 
 usage() {
   cat <<'USAGE'
@@ -29,12 +38,20 @@ usage:
 
 options:
   --build                    Build Dockerfile.sandbox before starting.
+  --backend NAME             Sandbox backend: docker, local-unsafe, e2b, docker-sandboxes
+                             (default: docker; e2b is a declared stub).
   --image NAME               Docker image name (default: rlm-sh-sandbox:dev).
   --root-model MODEL         Root controller model (default: gpt-5).
   --max-iters N              Maximum bash execution turns (default: 12).
   --max-root-calls N         Maximum host llm calls (default: 16).
   --exec-timeout SECONDS     Timeout per docker exec (default: 30).
   --truncate-chars N         Max command-output chars returned to root (default: 12000).
+  --depth N                  Current recursion depth (default: 0).
+  --parent-sandbox-id ID     Parent sandbox id for recursive runs.
+  --max-depth N              Maximum recursive depth (default: 2).
+  --max-spawns N             Maximum spawn requests this loop will process (default: 32).
+  --max-parallel-children N  Maximum child runs processed in parallel (default: 2).
+  --child-timeout SECONDS    Timeout for each child rlm-sh run (default: 900).
   --api-key-env NAME         Host env var holding the low-budget key (default: RLMSH_KEY).
   --system-prompt PATH       Root system prompt file (default: conf/system_prompt.md).
                              Swap this for the §10.4 ablation (min / strategy / example).
@@ -44,6 +61,7 @@ options:
   --allow-openai-key-fallback
                              Use OPENAI_API_KEY if --api-key-env is unset.
   --skip-preflight           Skip /work writable and /context read-only checks.
+  --no-orchestrator          Do not watch /work/.spawn for recursive child requests.
   --keep-container           Do not remove the container on exit.
 USAGE
 }
@@ -70,6 +88,10 @@ while [[ $# -gt 0 ]]; do
       IMAGE="$2"
       shift 2
       ;;
+    --backend)
+      BACKEND="$2"
+      shift 2
+      ;;
     --root-model)
       ROOT_MODEL="$2"
       shift 2
@@ -88,6 +110,30 @@ while [[ $# -gt 0 ]]; do
       ;;
     --truncate-chars)
       TRUNCATE_CHARS="$2"
+      shift 2
+      ;;
+    --depth)
+      DEPTH="$2"
+      shift 2
+      ;;
+    --parent-sandbox-id)
+      PARENT_SANDBOX_ID="$2"
+      shift 2
+      ;;
+    --max-depth)
+      MAX_DEPTH="$2"
+      shift 2
+      ;;
+    --max-spawns)
+      MAX_SPAWNS="$2"
+      shift 2
+      ;;
+    --max-parallel-children)
+      MAX_PARALLEL_CHILDREN="$2"
+      shift 2
+      ;;
+    --child-timeout)
+      CHILD_TIMEOUT="$2"
       shift 2
       ;;
     --api-key-env)
@@ -116,6 +162,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-preflight)
       SKIP_PREFLIGHT=1
+      shift
+      ;;
+    --no-orchestrator)
+      ORCHESTRATOR_ENABLED=0
       shift
       ;;
     -h|--help)
@@ -161,10 +211,22 @@ fi
 WORK_HOST="$RUN_DIR/work"
 ROOT_DB="$RUN_DIR/root.db"
 TRANSCRIPT="$RUN_DIR/transcript.md"
-mkdir -p "$WORK_HOST" "$RUN_DIR"
+CONTEXT_HASH_START="$RUN_DIR/context_hash.start.json"
+CONTEXT_HASH_END="$RUN_DIR/context_hash.end.json"
+ORCH_LOG="$RUN_DIR/orchestrator.log"
+mkdir -p "$WORK_HOST/.spawn" "$RUN_DIR"
+
+python3 "$SCRIPT_DIR/validators.py" hash-tree "$CONTEXT_DIR" --out "$CONTEXT_HASH_START"
+
+validate_context_hash() {
+  python3 "$SCRIPT_DIR/validators.py" validate-tree \
+    "$CONTEXT_DIR" \
+    --expected "$CONTEXT_HASH_START" \
+    --out "$CONTEXT_HASH_END"
+}
 
 if [[ "$BUILD_IMAGE" -eq 1 ]]; then
-  python3 "$SCRIPT_DIR/sandbox.py" build --image "$IMAGE"
+  python3 "$SCRIPT_DIR/sandbox.py" build --backend "$BACKEND" --image "$IMAGE"
 fi
 
 read_only_args=()
@@ -182,19 +244,61 @@ fi
 
 CONTAINER="$(
   python3 "$SCRIPT_DIR/sandbox.py" start \
+    --backend "$BACKEND" \
     --image "$IMAGE" \
     --work-dir "$WORK_HOST" \
     --context-dir "$CONTEXT_DIR" \
     --api-key-env "$API_KEY_ENV" \
     --run-id "$RUN_ID" \
+    --depth "$DEPTH" \
+    --parent-sandbox-id "$PARENT_SANDBOX_ID" \
     "${fallback_args[@]+"${fallback_args[@]}"}" \
     "${preflight_args[@]+"${preflight_args[@]}"}" \
     "${read_only_args[@]+"${read_only_args[@]}"}"
 )"
 
+ORCH_PID=""
+if [[ "$ORCHESTRATOR_ENABLED" -eq 1 ]]; then
+  python3 "$SCRIPT_DIR/orchestrator.py" \
+    --parent-work-dir "$WORK_HOST" \
+    --run-dir "$RUN_DIR" \
+    --run-id "$RUN_ID" \
+    --depth "$DEPTH" \
+    --max-depth "$MAX_DEPTH" \
+    --max-spawns "$MAX_SPAWNS" \
+    --max-parallel-children "$MAX_PARALLEL_CHILDREN" \
+    --poll-interval "$SPAWN_POLL_INTERVAL" \
+    --child-timeout "$CHILD_TIMEOUT" \
+    --child-max-iters "$MAX_ITERS" \
+    --child-max-root-calls "$MAX_ROOT_CALLS" \
+    --exec-timeout "$EXEC_TIMEOUT" \
+    --truncate-chars "$TRUNCATE_CHARS" \
+    --image "$IMAGE" \
+    --backend "$BACKEND" \
+    --api-key-env "$API_KEY_ENV" \
+    --root-model "$ROOT_MODEL" \
+    --system-prompt "$SYSTEM_PROMPT" \
+    "${fallback_args[@]+"${fallback_args[@]}"}" \
+    "${preflight_args[@]+"${preflight_args[@]}"}" \
+    "${read_only_args[@]+"${read_only_args[@]}"}" \
+    > "$ORCH_LOG" 2>&1 &
+  ORCH_PID="$!"
+fi
+
 cleanup() {
+  if [[ -n "${ORCH_PID:-}" ]]; then
+    kill "$ORCH_PID" >/dev/null 2>&1 || true
+    wait "$ORCH_PID" >/dev/null 2>&1 || true
+  fi
   if [[ "$KEEP_CONTAINER" -eq 0 && -n "${CONTAINER:-}" ]]; then
-    python3 "$SCRIPT_DIR/sandbox.py" stop --container "$CONTAINER" >/dev/null 2>&1 || true
+    if [[ "$DEPTH" -eq 0 ]]; then
+      python3 "$SCRIPT_DIR/sandbox.py" stop-run \
+        --backend "$BACKEND" \
+        --run-id "$RUN_ID" >/dev/null 2>&1 || true
+    else
+      python3 "$SCRIPT_DIR/sandbox.py" stop \
+        --container "$CONTAINER" >/dev/null 2>&1 || true
+    fi
   fi
 }
 trap cleanup EXIT INT TERM
@@ -202,6 +306,10 @@ trap cleanup EXIT INT TERM
 echo "rlm-sh: run_id=$RUN_ID" >&2
 echo "rlm-sh: run_dir=$RUN_DIR" >&2
 echo "rlm-sh: container=$CONTAINER" >&2
+echo "rlm-sh: backend=$BACKEND depth=$DEPTH max_depth=$MAX_DEPTH" >&2
+if [[ -n "${ORCH_PID:-}" ]]; then
+  echo "rlm-sh: orchestrator_pid=$ORCH_PID log=$ORCH_LOG" >&2
+fi
 
 SYS="$(cat "$SYSTEM_PROMPT")"
 echo "rlm-sh: system_prompt=$SYSTEM_PROMPT" >&2
@@ -239,6 +347,10 @@ echo "rlm-sh: root_cid=$ROOT_CID" >&2
   printf '- root_model: `%s`\n' "$ROOT_MODEL"
   printf '- root_db: `%s`\n' "$ROOT_DB"
   printf '- context_dir: `%s`\n\n' "$CONTEXT_DIR"
+  printf '- context_hash: `%s`\n' "$CONTEXT_HASH_START"
+  printf '- backend: `%s`\n' "$BACKEND"
+  printf '- depth: `%s`\n' "$DEPTH"
+  printf '- sandbox_id: `%s`\n\n' "$CONTAINER"
 } > "$TRANSCRIPT"
 
 for iter in $(seq 1 "$MAX_ITERS"); do
@@ -248,6 +360,7 @@ for iter in $(seq 1 "$MAX_ITERS"); do
     if python3 "$SCRIPT_DIR/sandbox.py" exec \
         --container "$CONTAINER" \
         --timeout "$EXEC_TIMEOUT" \
+        --parent-call-id "${RUN_ID}:depth${DEPTH}:iter${iter}" \
         -- "$(cat "$cmd_file")" > "$raw_file" 2>&1; then
       exit_status=0
     else
@@ -278,6 +391,10 @@ for iter in $(seq 1 "$MAX_ITERS"); do
   } >> "$TRANSCRIPT"
 
   if [[ -s "$WORK_HOST/answer.txt" ]]; then
+    if ! validate_context_hash; then
+      echo "loop_shell.sh: context hash changed; validation report is $CONTEXT_HASH_END" >&2
+      exit 76
+    fi
     cat "$WORK_HOST/answer.txt"
     exit 0
   fi
@@ -309,13 +426,19 @@ if python3 "$SCRIPT_DIR/loop_utils.py" extract-bash < "$final_reply" > "$final_c
   python3 "$SCRIPT_DIR/sandbox.py" exec \
     --container "$CONTAINER" \
     --timeout "$EXEC_TIMEOUT" \
+    --parent-call-id "${RUN_ID}:depth${DEPTH}:final" \
     -- "$(cat "$final_cmd")" > "$RUN_DIR/final.raw.txt" 2>&1 || true
 fi
 
 if [[ -s "$WORK_HOST/answer.txt" ]]; then
+  if ! validate_context_hash; then
+    echo "loop_shell.sh: context hash changed; validation report is $CONTEXT_HASH_END" >&2
+    exit 76
+  fi
   cat "$WORK_HOST/answer.txt"
   exit 0
 fi
 
+validate_context_hash >/dev/null || true
 echo "loop_shell.sh: no answer.txt produced; transcript is $TRANSCRIPT" >&2
 exit 1
